@@ -1,0 +1,65 @@
+# Python кэш и временные файлы
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.pyc
+*.pyo
+
+# Виртуальные окружения
+venv/
+env/
+ENV/
+*.venv
+
+# IDE файлы
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Логи
+*.log
+logs/
+
+# Конфиденциальные данные
+.env
+*.env
+config.ini
+secrets.json
+
+# Данные пользователей и бэкапы
+premium_users.json
+premium_users.json.backup
+*.backup
+backup_*
+
+# Временные файлы разработки
+temp_*
+fix_*
+test_*
+*_backup.py
+comprehensive_fixes.py
+
+# Документация разработки (не нужна на продакшене)
+*.md
+!README.md
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# База данных SQLite (если используется)
+*.db
+*.sqlite
+*.sqlite3
+
+# Временные текстовые файлы
+*.txt
+!requirements.txt
+!runtime.txt 
