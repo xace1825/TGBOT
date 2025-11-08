@@ -1,0 +1,20 @@
+{
+  "627786969": {
+    "is_premium": true,
+    "is_demo": false,
+    "demo_used": false,
+    "activated_at": "2025-11-11T23:24:27.952070",
+    "expires_at": "2025-12-11T23:24:27.952070",
+    "transaction_id": "7639730661_627786969_127969",
+    "duration_days": 30
+  },
+  "712118052": {
+    "is_premium": true,
+    "is_demo": true,
+    "demo_used": true,
+    "activated_at": "2025-06-08T01:26:39.194619",
+    "expires_at": "2025-06-22T01:26:39.194619",
+    "duration_days": 14,
+    "transaction_id": "demo_1749320799"
+  }
+}

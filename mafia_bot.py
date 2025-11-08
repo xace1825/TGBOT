@@ -3220,6 +3220,35 @@ async def create_game_from_pending_settings(query_or_update, context: CallbackCo
 
         logger.info(f"[DEBUG] Параметры игры: {num_players} игроков, режим: {game_mode}, версия: {version}")
 
+        # КРИТИЧЕСКАЯ ПРОВЕРКА ПРЕМИУМ ДОСТУПА
+        if version in ['paid', 'premium']:
+            user_premium_status, status_info = premium_db.check_premium_status(user.id)
+            if not user_premium_status:
+                logger.warning(f"[SECURITY] Пользователь {user.id} ({user.full_name}) попытался создать премиум игру без подписки!")
+                error_message = (
+                    "🚫 **Доступ запрещен!**\n\n"
+                    "Для создания премиум игры требуется активная подписка.\n\n"
+                    "💎 **Что дает премиум:**\n"
+                    "• До 20 игроков в игре\n"
+                    "• Все роли (Дон Мафии, Маньяк, Путана)\n"
+                    "• Ручная настройка ролей\n"
+                    "• Режим времени\n\n"
+                    f"**Ваш статус:** {status_info}"
+                )
+                
+                if hasattr(query_or_update, 'edit_message_text'):
+                    await query_or_update.edit_message_text(
+                        error_message,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("💎 Купить премиум", callback_data="buy_premium")],
+                            [InlineKeyboardButton("🔙 Назад", callback_data="create_game")]
+                        ]),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await query_or_update.message.reply_text(error_message, parse_mode=ParseMode.MARKDOWN)
+                return None
+
         # Проверяем корректность параметров
         if not (4 <= num_players <= 20):
             error_msg = f"Некорректное количество игроков: {num_players}"
@@ -3405,6 +3434,35 @@ async def create_timer_game_from_pending_settings(query_or_update, context: Call
         max_players = settings.get('num_players', 6)
         version = settings.get('version', 'paid')
         
+        # КРИТИЧЕСКАЯ ПРОВЕРКА ПРЕМИУМ ДОСТУПА
+        if version in ['paid', 'premium']:
+            user_premium_status, status_info = premium_db.check_premium_status(user.id)
+            if not user_premium_status:
+                logger.warning(f"[SECURITY] Пользователь {user.id} ({user.full_name}) попытался создать премиум игру без подписки!")
+                error_message = (
+                    "🚫 **Доступ запрещен!**\n\n"
+                    "Для создания премиум игры требуется активная подписка.\n\n"
+                    "💎 **Что дает премиум:**\n"
+                    "• До 20 игроков в игре\n"
+                    "• Все роли (Дон Мафии, Маньяк, Путана)\n"
+                    "• Ручная настройка ролей\n"
+                    "• Режим времени\n\n"
+                    f"**Ваш статус:** {status_info}"
+                )
+                
+                if hasattr(query_or_update, 'edit_message_text'):
+                    await query_or_update.edit_message_text(
+                        error_message,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("💎 Купить премиум", callback_data="buy_premium")],
+                            [InlineKeyboardButton("🔙 Назад", callback_data="create_game")]
+                        ]),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await query_or_update.message.reply_text(error_message, parse_mode=ParseMode.MARKDOWN)
+                return None
+
         # Генерируем ID игры
         game_id = "timer_" + generate_id(6)
 
