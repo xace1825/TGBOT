@@ -68,6 +68,44 @@ def get_minute_word(minutes: int) -> str:
     else:
         return "минут"
 
+def build_game_summary_text(game_data: dict) -> str:
+    """Краткая сводка состояния игры (фаза, живые и выбывшие)"""
+    state = game_data.get("state")
+    if state == STATE_NIGHT:
+        phase = f"🌙 Фаза: Ночь #{game_data.get('current_night_number', 1)}"
+    elif state == STATE_DAY:
+        phase = f"🌞 Фаза: День #{game_data.get('current_day_number', 1)}"
+    elif state == STATE_FINISHED:
+        phase = "🏁 Фаза: Игра завершена"
+    else:
+        phase = "🎮 Фаза: Подготовка"
+
+    alive = []
+    dead = []
+    for slot in game_data.get("players_slots", []):
+        name = get_player_display_name(slot)
+        if slot.get("status") == STATUS_ACTIVE:
+            alive.append(name)
+        elif slot.get("status") == STATUS_ELIMINATED:
+            dead.append(name)
+
+    alive_line = "👥 Живы: " + (", ".join(alive) if alive else "—")
+    dead_line = "💀 Выбыли: " + (", ".join(dead) if dead else "—")
+
+    return "📋 Краткая сводка игры\n" + phase + "\n" + alive_line + "\n" + dead_line
+
+async def send_game_summary_to_players(game_id: str, game_data: dict, context: CallbackContext):
+    """Отправляет краткую сводку игры всем участникам"""
+    summary_text = build_game_summary_text(game_data)
+    for slot in game_data.get("players_slots", []):
+        user_id = slot.get("user_id")
+        if not user_id:
+            continue
+        try:
+            await context.bot.send_message(user_id, summary_text)
+        except Exception as e:
+            logger.error(f"Error sending game summary to player {user_id} in game {game_id}: {e}")
+
 # Глобальные переменные
 TOKEN = "7639730661:AAEUaFtNCjbZAA4AzT6Vm8pqmjYuL2TRBG0"
 
@@ -2668,13 +2706,20 @@ async def start_day_after_night(game_id: str, game_data: dict, context: Callback
     if await check_game_end_conditions(game_id, game_data, context):
         return
 
+    # Клавиатура для перехода к обсуждению и голосованию
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    phase_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Перейти к обсуждению и голосованию", callback_data=f"phase_next_day_{game_id}")]
+    ])
+
     # Отправляем сообщение всем игрокам
     for slot in game_data["players_slots"]:
         if slot.get("user_id"):
             try:
                 await context.bot.send_message(
                     slot["user_id"],
-                    result_message
+                    result_message,
+                    reply_markup=phase_keyboard
                 )
             except Exception as e:
                 logger.error(f"Error sending day start message to player {slot.get('user_id')}: {e}")
@@ -2684,9 +2729,8 @@ async def start_day_after_night(game_id: str, game_data: dict, context: Callback
         import asyncio
         asyncio.create_task(send_role_reveal_choice_to_eliminated(game_id, eliminated_players, context))
 
-    # Запускаем дневное голосование через 10 секунд (сократил для тестирования)
-    import asyncio
-    asyncio.create_task(start_day_voting_after_delay(game_id, context))
+    # Отправляем краткую сводку состояния игры
+    await send_game_summary_to_players(game_id, game_data, context)
 
     games[game_id] = game_data
 
@@ -3015,6 +3059,9 @@ async def process_voting_results(game_id: str, game_data: dict, context: Callbac
     # Проверяем условия окончания игры
     if await check_game_end_conditions(game_id, game_data, context):
         return
+
+    # Отправляем краткую сводку состояния игры перед следующей ночью
+    await send_game_summary_to_players(game_id, game_data, context)
 
     # Запускаем следующую ночь
     await start_next_night(game_id, game_data, context)
@@ -4730,6 +4777,26 @@ async def button_callback_handler(update: Update, context: CallbackContext):
             except (ValueError, IndexError) as e:
                 await query.answer("❌ Ошибка в данных раскрытия роли", show_alert=True)
                 logger.error(f"Error parsing role reveal callback: {e}")
+    
+    # === ОБРАБОТКА ПЕРЕХОДА К ДНЕВНОМУ ГОЛОСОВАНИЮ ===
+    elif data.startswith("phase_next_day_"):
+        game_id = data.replace("phase_next_day_", "")
+        game_data = games.get(game_id)
+        if not game_data:
+            await query.answer("❌ Игра не найдена", show_alert=True)
+            return
+
+        if game_data.get("state") != STATE_DAY:
+            await query.answer("Сейчас нельзя перейти к голосованию", show_alert=True)
+            return
+
+        # Убираем кнопки из сообщения, чтобы избежать повторных нажатий
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as e:
+            logger.error(f"Error removing phase keyboard in game {game_id}: {e}")
+
+        await start_day_voting(game_id, game_data, context)
     
     # === ОБРАБОТЧИКИ КОНФЛИКТОВ ИГР ===
     
