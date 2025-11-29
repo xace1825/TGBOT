@@ -11,7 +11,7 @@ from datetime import datetime
 
 import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, CallbackContext, PreCheckoutQueryHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, CallbackContext, PreCheckoutQueryHandler, PollAnswerHandler
 from telegram.constants import ParseMode
 
 # Константы ролей
@@ -58,6 +58,9 @@ NIGHT_ROLES = [ROLE_MAFIA_DON, ROLE_MAFIA, ROLE_DOCTOR, ROLE_COMMISSIONER, ROLE_
 
 # Пассивные роли (без ночных способностей)
 PASSIVE_ROLES = [ROLE_PEACEFUL]
+
+# Ограничения Telegram для количества опций в опросе
+TELEGRAM_POLL_MAX_OPTIONS = 10
 
 def get_minute_word(minutes: int) -> str:
     """Возвращает правильную форму слова 'минута' в зависимости от числа"""
@@ -111,6 +114,9 @@ TOKEN = "7639730661:AAEUaFtNCjbZAA4AzT6Vm8pqmjYuL2TRBG0"
 
 # Глобальное хранилище игр
 games = {}
+
+# Активные телеграм-опросы: poll_id -> метаданные
+active_polls = {}
 
 # Хранилище математических примеров для пользователей
 user_math_state = {}
@@ -436,6 +442,51 @@ def get_player_display_name(slot: dict, context=None) -> str:
     real_name = slot.get("real_name", "Игрок")
     
     return f"{fictional_name} ({real_name})"
+
+def can_use_poll_with_candidates(candidate_count: int, include_skip: bool = True) -> bool:
+    """Проверяет, укладывается ли количество опций в лимит Telegram"""
+    options_needed = candidate_count + (1 if include_skip else 0)
+    return options_needed <= TELEGRAM_POLL_MAX_OPTIONS
+
+async def close_poll_collection(poll_ids: list, context: CallbackContext):
+    """Останавливает и очищает указанные опросы"""
+    if not poll_ids:
+        return
+    for poll_id in poll_ids:
+        poll_info = active_polls.pop(poll_id, None)
+        if not poll_info:
+            continue
+        try:
+            await context.bot.stop_poll(
+                chat_id=poll_info["chat_id"],
+                message_id=poll_info["message_id"]
+            )
+        except Exception as e:
+            logger.error(f"Error stopping poll {poll_id}: {e}")
+
+async def close_day_polls(game_id: str, context: CallbackContext):
+    """Останавливает все активные дневные опросы игры"""
+    game_data = games.get(game_id)
+    if not game_data:
+        return
+    poll_ids = game_data.get("day_poll_ids", [])
+    if not poll_ids:
+        return
+    await close_poll_collection(poll_ids, context)
+    game_data["day_poll_ids"] = []
+    games[game_id] = game_data
+
+async def close_mafia_polls(game_id: str, context: CallbackContext):
+    """Останавливает все активные ночные опросы мафии"""
+    game_data = games.get(game_id)
+    if not game_data:
+        return
+    poll_ids = game_data.get("mafia_poll_ids", [])
+    if not poll_ids:
+        return
+    await close_poll_collection(poll_ids, context)
+    game_data["mafia_poll_ids"] = []
+    games[game_id] = game_data
 
 
 
@@ -1742,11 +1793,78 @@ async def auto_skip_night_action(game_id: str, role: str, context: CallbackConte
     night_data["actions_taken_by_role"] = actions_taken
     game_data["night_data"] = night_data
     games[game_id] = game_data
+
+    if role == "Мафия":
+        await close_mafia_polls(game_id, context)
     
     logger.info(f"Auto-skipped night action for role {role} in game {game_id} due to timeout")
     
     # Проверяем, завершены ли все ночные действия
     await check_all_night_actions_completed(game_id, context)
+
+async def register_mafia_vote_choice(game_id: str, voter_id: int, target_index: int, context: CallbackContext):
+    """Проверяет выбор мафии, сохраняет голос и уведомляет остальных"""
+    game_data = games.get(game_id)
+    if not game_data:
+        return False, "❌ Игра не найдена", None, None
+
+    if game_data.get("state") != STATE_NIGHT:
+        return False, "❌ Сейчас не ночь", None, None
+
+    mafia_slot = None
+    for slot in game_data["players_slots"]:
+        if (slot.get("user_id") == voter_id and
+            slot.get("status") == STATUS_ACTIVE and
+            slot.get("role") in ["Мафиози", "Дон Мафии"]):
+            mafia_slot = slot
+            break
+
+    if not mafia_slot:
+        return False, "❌ Только мафия может выбирать жертву", None, None
+
+    if target_index >= len(game_data["players_slots"]) or target_index < 0:
+        return False, "❌ Неверный игрок", None, None
+
+    target_slot = game_data["players_slots"][target_index]
+    if target_slot.get("status") != STATUS_ACTIVE:
+        return False, "❌ Этот игрок уже исключен", None, None
+
+    if target_slot.get("role") in ["Мафиози", "Дон Мафии"]:
+        return False, "❌ Мафия не может убить мафию", None, None
+
+    if "mafia_votes" not in game_data:
+        game_data["mafia_votes"] = {}
+
+    game_data["mafia_votes"][voter_id] = target_index
+    games[game_id] = game_data
+
+    target_name = get_player_display_name(target_slot, context)
+    voter_name = get_player_display_name(mafia_slot, context)
+
+    # Уведомляем других членов мафии о голосе
+    for slot in game_data["players_slots"]:
+        if (slot.get("status") == STATUS_ACTIVE and
+            slot.get("role") in ["Мафиози", "Дон Мафии"] and
+            slot.get("user_id") and slot.get("user_id") != voter_id):
+            try:
+                await context.bot.send_message(
+                    slot["user_id"],
+                    f"👥 **Обновление от команды мафии**\n\n"
+                    f"🗳️ **{voter_name}** проголосовал за: **{target_name}**\n\n"
+                    f"💭 Обсудите выбор или сделайте свой голос!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"Error notifying other mafia member {slot['user_id']}: {e}")
+
+    mafia_count = len([slot for slot in game_data["players_slots"]
+                      if slot.get("status") == STATUS_ACTIVE and
+                         slot.get("role") in ["Мафиози", "Дон Мафии"]])
+
+    if len(game_data["mafia_votes"]) >= mafia_count:
+        await finalize_mafia_target(game_id, game_data, context)
+
+    return True, None, target_name, voter_name
 
 async def send_mafia_target_selection(game_id: str, game_data: dict, context: CallbackContext):
     """Отправляет мафии кнопки для выбора жертвы"""
@@ -1773,17 +1891,7 @@ async def send_mafia_target_selection(game_id: str, game_data: dict, context: Ca
         logger.error(f"No potential targets for mafia in game {game_id}")
         return
 
-    # Создаем клавиатуру с выбором жертвы
-    keyboard = []
-    for target_index, target_slot in potential_targets:
-        display_name = get_player_display_name(target_slot, context)
-        keyboard.append([InlineKeyboardButton(
-            f"🔪 {display_name}", 
-            callback_data=f"mafia_target_{game_id}_{target_index}"
-        )])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    use_poll = can_use_poll_with_candidates(len(potential_targets), include_skip=False)
     message_text = (
         f"🌙 **Ночь {game_data.get('current_night_number', 1)}**\n\n"
         f"🔪 **Мафия, выберите жертву:**\n\n"
@@ -1792,19 +1900,71 @@ async def send_mafia_target_selection(game_id: str, game_data: dict, context: Ca
         f"⏱️ **У вас есть 3 минуты на принятие решения.**\n"
         f"Выберите игрока, которого хотите устранить этой ночью."
     )
-
-    # Отправляем сообщение всем игрокам мафии
-    for mafia_slot in mafia_players:
-        try:
-            await context.bot.send_message(
-                mafia_slot["user_id"],
-                message_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup
-            )
-            logger.info(f"Mafia target selection sent to user {mafia_slot['user_id']} in game {game_id}")
-        except Exception as e:
-            logger.error(f"Error sending mafia target selection to user {mafia_slot['user_id']}: {e}")
+    
+    game_data["mafia_poll_ids"] = []
+    
+    if use_poll:
+        poll_options = []
+        option_mapping = {}
+        option_labels = {}
+        for idx, (target_index, target_slot) in enumerate(potential_targets):
+            display_name = get_player_display_name(target_slot, context)
+            poll_options.append(display_name)
+            option_mapping[idx] = target_index
+            option_labels[idx] = display_name
+        
+        for mafia_slot in mafia_players:
+            try:
+                await context.bot.send_message(
+                    mafia_slot["user_id"],
+                    message_text + "\n\n📊 Используйте опрос ниже, чтобы выбрать цель.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                poll_message = await context.bot.send_poll(
+                    chat_id=mafia_slot["user_id"],
+                    question="Кого устранить этой ночью?",
+                    options=poll_options,
+                    is_anonymous=False,
+                    allows_multiple_answers=False
+                )
+                poll_id = poll_message.poll.id
+                active_polls[poll_id] = {
+                    "type": "mafia",
+                    "game_id": game_id,
+                    "voter_user_id": mafia_slot["user_id"],
+                    "options_map": dict(option_mapping),
+                    "option_labels": dict(option_labels),
+                    "chat_id": poll_message.chat_id,
+                    "message_id": poll_message.message_id
+                }
+                game_data["mafia_poll_ids"].append(poll_id)
+                logger.info(f"Mafia poll sent to user {mafia_slot['user_id']} in game {game_id}")
+            except Exception as e:
+                logger.error(f"Error sending mafia poll to user {mafia_slot['user_id']}: {e}")
+    else:
+        keyboard = []
+        for target_index, target_slot in potential_targets:
+            display_name = get_player_display_name(target_slot, context)
+            keyboard.append([InlineKeyboardButton(
+                f"🔪 {display_name}", 
+                callback_data=f"mafia_target_{game_id}_{target_index}"
+            )])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        for mafia_slot in mafia_players:
+            try:
+                await context.bot.send_message(
+                    mafia_slot["user_id"],
+                    message_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+                logger.info(f"Mafia target selection sent to user {mafia_slot['user_id']} in game {game_id}")
+            except Exception as e:
+                logger.error(f"Error sending mafia target selection to user {mafia_slot['user_id']}: {e}")
+    
+    games[game_id] = game_data
     
     # Запускаем таймер для мафии
     import asyncio
@@ -2051,61 +2211,18 @@ async def send_prostitute_target_selection(game_id: str, game_data: dict, contex
 
 async def handle_mafia_target_selection(query, context: CallbackContext, game_id: str, target_index: int):
     """Обрабатывает выбор жертвы мафией"""
-    game_data = games.get(game_id)
-    if not game_data:
-        await query.answer("❌ Игра не найдена", show_alert=True)
-        return
-
-    if game_data.get("state") != STATE_NIGHT:
-        await query.answer("❌ Сейчас не ночь", show_alert=True)
-        return
-
     voter_id = query.from_user.id
-    
-    # Проверяем, что голосующий - мафия
-    is_mafia = False
-    for slot in game_data["players_slots"]:
-        if (slot.get("user_id") == voter_id and 
-            slot.get("status") == STATUS_ACTIVE and
-            slot.get("role") in ["Мафиози", "Дон Мафии"]):
-            is_mafia = True
-            break
+    success, error_message, target_name, _ = await register_mafia_vote_choice(
+        game_id,
+        voter_id,
+        target_index,
+        context
+    )
 
-    if not is_mafia:
-        await query.answer("❌ Только мафия может выбирать жертву", show_alert=True)
+    if not success:
+        await query.answer(error_message or "❌ Не удалось принять голос", show_alert=True)
         return
 
-    # Проверяем, что цель существует и активна
-    if target_index >= len(game_data["players_slots"]):
-        await query.answer("❌ Неверный игрок", show_alert=True)
-        return
-
-    target_slot = game_data["players_slots"][target_index]
-    if target_slot.get("status") != STATUS_ACTIVE:
-        await query.answer("❌ Этот игрок уже исключен", show_alert=True)
-        return
-
-    if target_slot.get("role") in ["Мафиози", "Дон Мафии"]:
-        await query.answer("❌ Мафия не может убить мафию", show_alert=True)
-        return
-
-    # Проверяем, не было ли уже сделано выбора мафией
-    if "mafia_votes" not in game_data:
-        game_data["mafia_votes"] = {}
-
-    # Записываем голос мафии
-    game_data["mafia_votes"][voter_id] = target_index
-    games[game_id] = game_data
-
-    target_name = get_player_display_name(target_slot, context)
-    
-    # Находим имя голосующего мафиози
-    voter_name = "Член мафии"
-    for slot in game_data["players_slots"]:
-        if slot.get("user_id") == voter_id:
-            voter_name = get_player_display_name(slot, context)
-            break
-    
     await query.edit_message_text(
         f"✅ **Цель выбрана**\n\n"
         f"🔪 Вы выбрали: **{target_name}**\n\n"
@@ -2114,33 +2231,6 @@ async def handle_mafia_target_selection(query, context: CallbackContext, game_id
     )
 
     logger.info(f"Mafia member {voter_id} chose target {target_index} ({target_name}) in game {game_id}")
-
-    # Уведомляем ОСТАЛЬНЫХ членов мафии о выборе товарища
-    for slot in game_data["players_slots"]:
-        if (slot.get("status") == STATUS_ACTIVE and 
-            slot.get("role") in ["Мафиози", "Дон Мафии"] and
-            slot.get("user_id") and slot.get("user_id") != voter_id):
-            try:
-                await context.bot.send_message(
-                    slot["user_id"],
-                    f"👥 **Обновление от команды мафии**\n\n"
-                    f"🗳️ **{voter_name}** проголосовал за: **{target_name}**\n\n"
-                    f"💭 Обсудите выбор или сделайте свой голос!",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                logger.error(f"Error notifying other mafia member {slot['user_id']}: {e}")
-
-    # Проверяем, все ли члены мафии сделали выбор
-    mafia_count = len([slot for slot in game_data["players_slots"] 
-                      if slot.get("status") == STATUS_ACTIVE and 
-                         slot.get("role") in ["Мафиози", "Дон Мафии"]])
-    
-    votes_count = len(game_data["mafia_votes"])
-    
-    if votes_count >= mafia_count:
-        # Все мафия проголосовала, определяем окончательную цель
-        await finalize_mafia_target(game_id, game_data, context)
 
 async def handle_doctor_target_selection(query, context: CallbackContext, game_id: str, target_index: int):
     """Обрабатывает выбор пациента доктором с подтверждением"""
@@ -2572,6 +2662,10 @@ async def finalize_mafia_target(game_id: str, game_data: dict, context: Callback
     
     # Очищаем голоса мафии
     game_data["mafia_votes"] = {}
+
+    # Останавливаем опросы мафии, если они использовались
+    await close_mafia_polls(game_id, context)
+
     games[game_id] = game_data
 
     logger.info(f"Mafia finalized target: {final_target_slot['fictional_name']} in game {game_id}")
@@ -2891,77 +2985,158 @@ async def start_day_voting(game_id: str, game_data: dict, context: CallbackConte
         await check_game_end_conditions(game_id, game_data, context)
         return
 
-    # Создаем кнопки для голосования (изначально без голосов)
-    keyboard = []
-    for i, name in active_players:
-        button_text = f"🗳️ {name}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"vote_{game_id}_{i}")])
-    
-    # Добавляем кнопку пропуска
-    keyboard.append([InlineKeyboardButton("⭕ Пропустить голосование", callback_data=f"vote_skip_{game_id}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     # Создаем детализированное сообщение с именами игроков
-    player_list = "\n".join([f"• {name} - 0 голос(ов)" for i, name in active_players])
+    player_list = "\n".join([f"• {name}" for _, name in active_players])
     
-    voting_message = (
-        f"🗳️ **Дневное голосование**\n\n"
-        f"💬 **ЧАТ АКТИВЕН!** Можете обсуждать кандидатов.\n"
-        f"Просто напишите сообщение боту - оно будет видно всем живым игрокам.\n\n"
-        f"Время выбрать, кого изгнать из города!\n"
-        f"У каждого есть 3 минуты на голосование.\n\n"
-        f"👥 **Живые игроки:**\n{player_list}\n"
-        f"⭕ Пропустить голосование - 0 голос(ов)\n\n"
-        f"📊 **Проголосовало:** 0/{len(players_with_voting_rights)} игроков"
-    )
-
-    # Отправляем сообщение всем игрокам, но с разными правами голосования
-    for slot in game_data["players_slots"]:
-        if slot.get("status") == STATUS_ACTIVE and slot.get("user_id"):
-            user_id = slot.get("user_id")
-            # Найдем индекс игрока для проверки прав голосования
-            slot_index = None
-            for i, s in enumerate(game_data["players_slots"]):
-                if s.get("user_id") == user_id:
-                    slot_index = i
-                    break
+    use_poll = can_use_poll_with_candidates(len(active_players))
+    game_data["day_poll_ids"] = []
+    
+    if use_poll:
+        poll_text = (
+            f"🗳️ **Дневное голосование**\n\n"
+            f"💬 **ЧАТ АКТИВЕН!** Можете обсуждать кандидатов.\n"
+            f"Просто напишите сообщение боту - оно будет видно всем живым игрокам.\n\n"
+            f"Каждый из вас получил опрос с именами подозреваемых.\n"
+            f"⏱️ У вас есть 3 минуты, чтобы выбрать одного игрока или пропустить голосование.\n\n"
+            f"👥 **Живые игроки:**\n{player_list}"
+        )
+        
+        poll_options = []
+        option_mapping = {}
+        option_labels = {}
+        for idx, (player_index, name) in enumerate(active_players):
+            poll_options.append(name)
+            option_mapping[idx] = player_index
+            option_labels[idx] = name
+        skip_index = len(poll_options)
+        poll_options.append("⭕ Пропустить голосование")
+        option_mapping[skip_index] = "skip"
+        option_labels[skip_index] = "Пропустить голосование"
+        
+        for slot_idx, slot in enumerate(game_data["players_slots"]):
+            if slot.get("status") != STATUS_ACTIVE or not slot.get("user_id"):
+                continue
             
-            player_key = f"player_{slot_index}" if slot_index is not None else None
-            
-            # Проверяем права голосования только в режиме бот-ведущего
-            if game_mode == "bot_host" and player_key:
+            user_id = slot["user_id"]
+            player_key = f"player_{slot_idx}"
+            if game_mode == "bot_host":
                 has_voting_rights = voting_rights.get(player_key, True)
             else:
-                has_voting_rights = True  # В режиме человек-ведущего все имеют право голоса
+                has_voting_rights = True
             
             try:
+                await context.bot.send_message(
+                    user_id,
+                    poll_text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
                 if has_voting_rights:
-                    # Игрок может голосовать
-                    await context.bot.send_message(
-                        user_id,
-                        voting_message,
-                        reply_markup=reply_markup,
-                        parse_mode=ParseMode.MARKDOWN
+                    poll_message = await context.bot.send_poll(
+                        chat_id=user_id,
+                        question=f"День {game_data.get('current_day_number', 1)}: кого изгнать?",
+                        options=poll_options,
+                        is_anonymous=False,
+                        allows_multiple_answers=False
                     )
+                    poll_id = poll_message.poll.id
+                    active_polls[poll_id] = {
+                        "type": "day",
+                        "game_id": game_id,
+                        "voter_user_id": user_id,
+                        "options_map": dict(option_mapping),
+                        "option_labels": dict(option_labels),
+                        "chat_id": poll_message.chat_id,
+                        "message_id": poll_message.message_id
+                    }
+                    game_data["day_poll_ids"].append(poll_id)
                 else:
-                    # Игрок лишен права голоса (только в режиме бот-ведущего)
-                    no_vote_message = (
-                        f"🗳️ **Дневное голосование**\n\n"
-                        f"Обсуждение окончено. Время выбрать, кого изгнать из города!\n\n"
-                        f"❌ **У вас нет права голоса** из-за неправильного ответа на ночное задание.\n"
-                        f"💡 В следующую ночь у вас будет возможность восстановить право голоса."
-                    )
                     await context.bot.send_message(
                         user_id,
-                        no_vote_message,
+                        "❌ Вы временно лишены права голоса из-за ошибки в ночном задании.\n"
+                        "💡 В следующую ночь появится шанс его вернуть.",
                         parse_mode=ParseMode.MARKDOWN
                     )
-                    logger.info(f"Player {user_id} cannot vote due to math failure in bot-host mode")
-                    
             except Exception as e:
-                logger.error(f"Error sending voting message to player {user_id}: {e}")
-
+                logger.error(f"Error sending poll voting message to player {user_id}: {e}")
+        
+        # Сообщаем хосту, если он вне игры и режим не bot_host
+        host_is_player = any(
+            slot.get("status") == STATUS_ACTIVE and slot.get("user_id") == game_data["host_id"]
+            for slot in game_data["players_slots"]
+        )
+        if not host_is_player and game_data.get("game_mode") != "bot_host":
+            try:
+                await context.bot.send_message(
+                    game_data["host_id"],
+                    f"🗳️ В игре {game_id} началось дневное голосование через опросы.\n"
+                    f"Живых игроков: {len(active_players)}.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"Error sending host update for polls: {e}")
+    else:
+        # Возвращаемся к прежнему интерфейсу с кнопками, если игроков слишком много для опроса
+        keyboard = []
+        for i, name in active_players:
+            button_text = f"🗳️ {name}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"vote_{game_id}_{i}")])
+        
+        keyboard.append([InlineKeyboardButton("⭕ Пропустить голосование", callback_data=f"vote_skip_{game_id}")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        voting_message = (
+            f"🗳️ **Дневное голосование**\n\n"
+            f"💬 **ЧАТ АКТИВЕН!** Можете обсуждать кандидатов.\n"
+            f"Просто напишите сообщение боту - оно будет видно всем живым игрокам.\n\n"
+            f"Время выбрать, кого изгнать из города!\n"
+            f"У каждого есть 3 минуты на голосование.\n\n"
+            f"👥 **Живые игроки:**\n{player_list}\n"
+            f"⭕ Пропустить голосование - 0 голос(ов)\n\n"
+            f"📊 **Проголосовало:** 0/{len(players_with_voting_rights)} игроков"
+        )
+        
+        for slot in game_data["players_slots"]:
+            if slot.get("status") == STATUS_ACTIVE and slot.get("user_id"):
+                user_id = slot.get("user_id")
+                slot_index = None
+                for i, s in enumerate(game_data["players_slots"]):
+                    if s.get("user_id") == user_id:
+                        slot_index = i
+                        break
+                
+                player_key = f"player_{slot_index}" if slot_index is not None else None
+                
+                if game_mode == "bot_host" and player_key:
+                    has_voting_rights = voting_rights.get(player_key, True)
+                else:
+                    has_voting_rights = True
+                
+                try:
+                    if has_voting_rights:
+                        await context.bot.send_message(
+                            user_id,
+                            voting_message,
+                            reply_markup=reply_markup,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    else:
+                        no_vote_message = (
+                            f"🗳️ **Дневное голосование**\n\n"
+                            f"Обсуждение окончено. Время выбрать, кого изгнать из города!\n\n"
+                            f"❌ **У вас нет права голоса** из-за неправильного ответа на ночное задание.\n"
+                            f"💡 В следующую ночь у вас будет возможность восстановить право голоса."
+                        )
+                        await context.bot.send_message(
+                            user_id,
+                            no_vote_message,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        logger.info(f"Player {user_id} cannot vote due to math failure in bot-host mode")
+                        
+                except Exception as e:
+                    logger.error(f"Error sending button voting message to player {user_id}: {e}")
+    
     # Запускаем таймер на 3 минуты
     import asyncio
     asyncio.create_task(end_voting_after_timeout(game_id, context))
@@ -2989,6 +3164,9 @@ async def process_voting_results(game_id: str, game_data: dict, context: Callbac
     game_data["voting_active"] = False
     votes = game_data.get("votes", {})
 
+    # Останавливаем активные опросы дня (если использовались)
+    await close_day_polls(game_id, context)
+
     # Подсчитываем голоса и создаем детальную статистику
     vote_counts = {}
     voting_details = []
@@ -3014,8 +3192,8 @@ async def process_voting_results(game_id: str, game_data: dict, context: Callbac
         
         voting_details.append(f"• {voter_name} → {voted_for_name}")
 
-    # Создаем сводку голосования
-    voting_summary = "\n📋 **Детали голосования:**\n" + "\n".join(voting_details) + "\n\n"
+    # Создаем сводку голосования (лаконичный, хорошо читаемый блок)
+    voting_summary = "📋 Детали голосования:\n" + "\n".join(voting_details)
 
     # Находим игрока с наибольшим количеством голосов
     if not vote_counts:
@@ -3041,7 +3219,12 @@ async def process_voting_results(game_id: str, game_data: dict, context: Callbac
             
             # Используем новую функцию для отображения имени
             eliminated_display_name = get_player_display_name(eliminated_slot, context)
-            result_message = f"📊 По результатам голосования изгнан: {eliminated_display_name} (Роль: {eliminated_slot['role']})\n\n{voting_summary}"
+            result_message = (
+                "🏛 Итоги голосования\n"
+                f"👤 Изгнан: {eliminated_display_name}\n"
+                f"🎭 Роль: {eliminated_slot['role']}\n\n"
+                f"{voting_summary}"
+            )
 
     # Отправляем результаты всем игрокам
     for slot in game_data["players_slots"]:
@@ -3065,6 +3248,78 @@ async def process_voting_results(game_id: str, game_data: dict, context: Callbac
 
     # Запускаем следующую ночь
     await start_next_night(game_id, game_data, context)
+
+async def handle_day_poll_vote(poll_data: dict, user_id: int, choice_value, option_index: int, context: CallbackContext):
+    """Обрабатывает ответ в дневном опросе"""
+    voter_id = poll_data.get("voter_user_id")
+    if user_id != voter_id:
+        return
+    
+    game_id = poll_data.get("game_id")
+    game_data = games.get(game_id)
+    if not game_data or not game_data.get("voting_active"):
+        return
+    
+    game_data["votes"][voter_id] = choice_value
+    games[game_id] = game_data
+    
+    choice_label = poll_data.get("option_labels", {}).get(option_index, "—")
+    try:
+        await context.bot.send_message(
+            voter_id,
+            f"🗳️ Голос принят: {choice_label}"
+        )
+    except Exception as e:
+        logger.error(f"Error sending poll confirmation to player {voter_id}: {e}")
+
+async def handle_mafia_poll_vote(poll_data: dict, user_id: int, target_index: int, option_index: int, context: CallbackContext):
+    """Обрабатывает ответ мафии в ночном опросе"""
+    voter_id = poll_data.get("voter_user_id")
+    if user_id != voter_id:
+        return
+    
+    success, error_message, target_name, _ = await register_mafia_vote_choice(
+        poll_data.get("game_id"),
+        voter_id,
+        target_index,
+        context
+    )
+    
+    if success:
+        try:
+            await context.bot.send_message(
+                voter_id,
+                f"🔪 Вы выбрали: {target_name}. Ожидаем союзников."
+            )
+        except Exception as e:
+            logger.error(f"Error sending mafia poll confirmation to {voter_id}: {e}")
+    elif error_message:
+        try:
+            await context.bot.send_message(voter_id, error_message)
+        except Exception as e:
+            logger.error(f"Error sending mafia poll error to {voter_id}: {e}")
+
+async def handle_poll_answer(update: Update, context: CallbackContext):
+    """Глобальный обработчик ответов на телеграм-опросы"""
+    poll_answer = update.poll_answer
+    poll_id = poll_answer.poll_id
+    poll_data = active_polls.get(poll_id)
+    if not poll_data:
+        return
+    
+    option_ids = poll_answer.option_ids
+    if not option_ids:
+        return
+    
+    selected_option = option_ids[0]
+    choice_value = poll_data.get("options_map", {}).get(selected_option)
+    if choice_value is None:
+        return
+    
+    if poll_data.get("type") == "day":
+        await handle_day_poll_vote(poll_data, poll_answer.user.id, choice_value, selected_option, context)
+    elif poll_data.get("type") == "mafia":
+        await handle_mafia_poll_vote(poll_data, poll_answer.user.id, choice_value, selected_option, context)
 
 async def start_runoff_voting(game_id: str, game_data: dict, tied_candidates: list, voting_summary: str, context: CallbackContext):
     """Запускает дополнительное голосование между игроками с равным количеством голосов"""
@@ -3214,20 +3469,32 @@ async def check_game_end_conditions(game_id: str, game_data: dict, context: Call
         game_data["winner"] = winner
         games[game_id] = game_data
 
-        # Создаём подробную статистику ролей
-        role_stats = []
+        # Создаём подробную, но компактную статистику ролей
+        alive_block = []
+        dead_block = []
         for slot in game_data["players_slots"]:
             if slot.get("user_id"):
                 player_name = get_player_display_name(slot, context)
                 role = slot.get("role", "Неизвестно")
-                status = "🟢 Выжил" if slot.get("status") == STATUS_ACTIVE else "💀 Погиб"
-                role_stats.append(f"• {player_name}: **{role}** - {status}")
+                line = f"• {player_name}: {role}"
+                if slot.get("status") == STATUS_ACTIVE:
+                    alive_block.append(f"{line} — 🟢 выжил")
+                else:
+                    dead_block.append(f"{line} — 💀 погиб")
+
+        stats_parts = []
+        if alive_block:
+            stats_parts.append("✅ Выжившие:\n" + "\n".join(alive_block))
+        if dead_block:
+            stats_parts.append("☠️ Погибшие:\n" + "\n".join(dead_block))
+
+        stats_text = "\n\n".join(stats_parts) if stats_parts else "Нет данных по игрокам."
 
         final_message = (
-            f"🏁 **ИГРА ЗАВЕРШЕНА!**\n\n"
+            "🏁 ИГРА ЗАВЕРШЕНА!\n"
             f"{winner_message}\n\n"
-            f"👥 **Статистика игроков:**\n" + "\n".join(role_stats) + "\n\n"
-            f"🎭 Спасибо за игру! Хотите сыграть ещё раз?"
+            f"{stats_text}\n\n"
+            "🎭 Спасибо за игру! Хотите сыграть ещё раз?"
         )
 
         # Отправляем сообщение о завершении игры всем участникам
@@ -6449,6 +6716,7 @@ def main():
     application.add_handler(CommandHandler("premium_admin", premium_admin_command))
     application.add_handler(CommandHandler("demo", activate_demo_command))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
+    application.add_handler(PollAnswerHandler(handle_poll_answer))
     
     # ВАЖНО: Обработчик игрового чата должен быть ДО обработчика ввода количества игроков
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_game_chat_message))
