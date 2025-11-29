@@ -429,6 +429,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Приглушаем шум от httpx/telegram, чтобы в логах оставалась только важная инфа
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.WARNING)
+
 def generate_id(length=6):
     """Генерирует уникальный ID игры"""
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
