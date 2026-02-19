@@ -2962,6 +2962,7 @@ async def start_day_voting(game_id: str, game_data: dict, context: CallbackConte
     # Инициализируем голосование в начале
     game_data["voting_active"] = True
     game_data["votes"] = {}
+    game_data["poll_results_messages"] = {}  # Для хранения message_id сообщений с результатами опросов
     games[game_id] = game_data
 
     # Получаем список активных игроков для голосования
@@ -3171,6 +3172,10 @@ async def process_voting_results(game_id: str, game_data: dict, context: Callbac
 
     # Останавливаем активные опросы дня (если использовались)
     await close_day_polls(game_id, context)
+    
+    # Очищаем сообщения с результатами опросов
+    game_data.pop("poll_results_messages", None)
+    games[game_id] = game_data
 
     # Подсчитываем голоса и создаем детальную статистику
     vote_counts = {}
@@ -3254,6 +3259,119 @@ async def process_voting_results(game_id: str, game_data: dict, context: Callbac
     # Запускаем следующую ночь
     await start_next_night(game_id, game_data, context)
 
+async def send_poll_vote_results(game_id: str, game_data: dict, voter_id: int, choice_label: str, context: CallbackContext):
+    """Отправляет результаты голосования всем игрокам после каждого голоса в опросе"""
+    current_votes = game_data.get("votes", {})
+    
+    # Создаем список всех голосов
+    voting_status = []
+    for v_id, v_for in current_votes.items():
+        # Находим имя голосующего
+        v_name = "Неизвестный"
+        for slot in game_data["players_slots"]:
+            if slot.get("user_id") == v_id:
+                v_name = get_player_display_name(slot, context)
+                break
+        
+        # Находим за кого проголосовали
+        if v_for == "skip":
+            v_for_name = "Пропуск голосования"
+        else:
+            v_for_slot = game_data["players_slots"][v_for]
+            v_for_name = get_player_display_name(v_for_slot, context)
+        
+        voting_status.append(f"• {v_name} → {v_for_name}")
+    
+    # Подсчитываем количество игроков с правом голоса
+    game_mode = game_data.get("game_mode", "human_host")
+    voting_rights = game_data.get("day_voting_rights", {})
+    players_with_rights_count = 0
+    
+    for i, slot in enumerate(game_data["players_slots"]):
+        if slot.get("status") == STATUS_ACTIVE:
+            player_key = f"player_{i}"
+            if game_mode == "bot_host":
+                has_voting_rights = voting_rights.get(player_key, True)
+            else:
+                has_voting_rights = True
+            if has_voting_rights:
+                players_with_rights_count += 1
+    
+    total_voted = len(current_votes)
+    
+    # Формируем сообщение с результатами
+    results_message = (
+        f"🗳️ **Голос принят!**\n\n"
+        f"✅ Вы проголосовали за: **{choice_label}**\n\n"
+        f"📊 **Текущие голоса:**\n" + "\n".join(voting_status) + "\n\n"
+        f"👥 Проголосовало: {total_voted}/{players_with_rights_count} игроков"
+    )
+    
+    # Отправляем результаты голосующему игроку
+    try:
+        if "poll_results_messages" not in game_data:
+            game_data["poll_results_messages"] = {}
+        
+        # Если у игрока уже есть сообщение с результатами, обновляем его
+        if voter_id in game_data["poll_results_messages"]:
+            try:
+                await context.bot.edit_message_text(
+                    text=results_message,
+                    chat_id=voter_id,
+                    message_id=game_data["poll_results_messages"][voter_id],
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                # Если не удалось обновить, отправляем новое
+                msg = await context.bot.send_message(
+                    voter_id,
+                    results_message,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                game_data["poll_results_messages"][voter_id] = msg.message_id
+        else:
+            # Отправляем новое сообщение
+            msg = await context.bot.send_message(
+                voter_id,
+                results_message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            game_data["poll_results_messages"][voter_id] = msg.message_id
+        
+        games[game_id] = game_data
+    except Exception as e:
+        logger.error(f"Error sending poll results to player {voter_id}: {e}")
+    
+    # Обновляем результаты у всех остальных игроков, которые уже проголосовали
+    for other_voter_id in current_votes.keys():
+        if other_voter_id == voter_id:
+            continue
+        
+        if other_voter_id in game_data.get("poll_results_messages", {}):
+            other_choice = current_votes.get(other_voter_id)
+            if other_choice == "skip":
+                other_choice_label = "Пропуск голосования"
+            else:
+                other_slot = game_data["players_slots"][other_choice]
+                other_choice_label = get_player_display_name(other_slot, context)
+            
+            other_results_message = (
+                f"🗳️ **Ваш голос засчитан!**\n\n"
+                f"✅ Вы проголосовали за: **{other_choice_label}**\n\n"
+                f"📊 **Текущие голоса:**\n" + "\n".join(voting_status) + "\n\n"
+                f"👥 Проголосовало: {total_voted}/{players_with_rights_count} игроков"
+            )
+            
+            try:
+                await context.bot.edit_message_text(
+                    text=other_results_message,
+                    chat_id=other_voter_id,
+                    message_id=game_data["poll_results_messages"][other_voter_id],
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"Error updating poll results for player {other_voter_id}: {e}")
+
 async def handle_day_poll_vote(poll_data: dict, user_id: int, choice_value, option_index: int, context: CallbackContext):
     """Обрабатывает ответ в дневном опросе"""
     voter_id = poll_data.get("voter_user_id")
@@ -3265,17 +3383,27 @@ async def handle_day_poll_vote(poll_data: dict, user_id: int, choice_value, opti
     if not game_data or not game_data.get("voting_active"):
         return
     
+    # Проверяем, не голосовал ли уже этот игрок
+    if voter_id in game_data.get("votes", {}):
+        try:
+            await context.bot.send_message(
+                voter_id,
+                "⚠️ Вы уже проголосовали!"
+            )
+        except Exception as e:
+            logger.error(f"Error sending duplicate vote warning to player {voter_id}: {e}")
+        return
+    
     game_data["votes"][voter_id] = choice_value
     games[game_id] = game_data
     
     choice_label = poll_data.get("option_labels", {}).get(option_index, "—")
-    try:
-        await context.bot.send_message(
-            voter_id,
-            f"🗳️ Голос принят: {choice_label}"
-        )
-    except Exception as e:
-        logger.error(f"Error sending poll confirmation to player {voter_id}: {e}")
+    
+    # Отправляем подтверждение и результаты голосования
+    await send_poll_vote_results(game_id, game_data, voter_id, choice_label, context)
+    
+    # Проверяем, все ли проголосовали
+    await check_if_all_voted_and_finish(game_id, game_data, context)
 
 async def handle_mafia_poll_vote(poll_data: dict, user_id: int, target_index: int, option_index: int, context: CallbackContext):
     """Обрабатывает ответ мафии в ночном опросе"""
